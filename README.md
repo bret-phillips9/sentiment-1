@@ -1,4 +1,4 @@
-This project produces a Quarto document that ingests a CSV file of tweets that have been labeled as possessing either good, bad, or neutral sentiment towards ChatGPT.  
+This project produces a Quarto document with embedded R code that ingests a CSV file of tweets that have been labeled as possessing either good, bad, or neutral sentiment towards ChatGPT.  
 
 The text of each tweet is converted into embeddings by (ironically) ChatGPT.
 

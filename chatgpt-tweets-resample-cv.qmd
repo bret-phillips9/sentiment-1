@@ -1,0 +1,152 @@
+---
+title: "Sentiment Analysis with OpenAI Embeddings and R"
+format: html
+execute:
+  echo: true
+---
+
+We begin by installing all necessary libraries. We also retrieve the environment variable OPENAI_API_KEY, which is set in a separate initialization script.
+
+```{r setup}
+#install.packages("glmnet")
+library(tidyverse)
+library(tidytext)
+library(textstem)
+library(caret)
+library(glmnet)
+library(jsonlite)
+library(httr)
+
+# --------------------------------------------
+#  Set your API key - done outside of this code
+# --------------------------------------------
+openai_api_key <- Sys.getenv("OPENAI_API_KEY")
+if (openai_api_key == "") {
+  stop("Please set OPENAI_API_KEY environment variable.")
+}
+```
+
+Now we read in our CSV datafile of 219.254 tweets regarding ChatGPT.
+
+```{r}
+data <- read_csv("file.csv")
+
+# Expecting columns: recid, tweet_txt, label_txt
+
+head(data)
+
+```
+
+The text of the tweets must be cleaned before sending to ChatGPT: removing non-letter characters and extra spaces, removing stop words, and lemmatizing.
+
+```{r}
+stop_words <- tidytext::stop_words
+
+clean_data <- data |>
+    mutate(text_clean = tweet_txt |>
+    str_to_lower() |>
+    str_replace_all("[^a-z]", " ") |>
+    str_squish()) |>
+    unnest_tokens(word, text_clean) |>
+    anti_join(stop_words, by = "word") |>
+    mutate(word = lemmatize_words(word)) |>
+    group_by(recid, label_txt) |>
+    summarize(text_clean = paste(word, collapse = " "), .groups = "drop")
+
+head(clean_data)
+```
+
+We now define a function for retrieving the embedding of tweet content from ChatGPT via the OpenAI API.
+
+```{r get-embeddings}
+get_embedding <- function(texts, model = "text-embedding-3-small") {
+
+    url <- "https://api.openai.com/v1/embeddings"
+
+    response <- POST(
+        url,
+        add_headers(
+            Authorization = paste("Bearer", openai_api_key),
+            `Content-Type` = "application/json"
+            ),
+            body = list(
+            model = model,
+            input = texts
+            ),
+        encode = "json"
+)
+
+result <- content(response, as = "parsed", simplifyVector = TRUE)
+
+embeddings <- result$data$embedding
+return(embeddings)
+}
+
+```
+
+The above function is called iteratively to build a data frame of embeddings.
+
+```{r compile-embeddings}
+batch_size <- 50
+texts <- clean_data$text_clean
+n <- length(texts)
+
+emb_list <- list()
+
+for (i in seq(1, n, by = batch_size)) {
+    batch <- texts[i:min(i + batch_size - 1, n)]
+    emb <- get_embedding(batch)
+    emb_list <- append(emb_list, emb)
+}
+
+emb_matrix <- do.call(rbind, emb_list)
+
+# Combine with labels
+
+sentiment <- clean_data$label_txt
+emb_df <- as.data.frame(emb_matrix)
+emb_df$sentiment <- sentiment
+
+```
+
+It was expected that building the embeddings data frame would take a while. It took somewhere between 30 and 45 minutes.
+
+We split the data 80/20 into training and test sets.
+
+```{r split-data}
+set.seed(123)
+train_index <- createDataPartition(emb_df$sentiment, p = 0.8, list = FALSE)
+
+train <- emb_df[train_index, ]
+test  <- emb_df[-train_index, ]
+
+```
+
+We now do resampling with 10-fold cross-validation to estimate prediction of sentiment from embedded tweet content.
+
+```{r training}
+ctrl <- trainControl(method = "cv", number = 10)
+
+model <- train(
+    sentiment ~ .,
+    data = train,
+    method = "glmnet",
+    trControl = ctrl
+    )
+
+model
+
+```
+
+On a laptop CPU, training took several hours. I was not expecting it to take so long so I did not build in a timer. This step probably should be farmed out to a GPU in the cloud in a production environment.
+
+Model training weights are now applied to the test data to evaluate performance in a confusion matrix.
+
+```{r confusion-matrix}
+pred <- predict(model, newdata = test)
+# confusionMatrix expects factor data when variables are strings
+test$sentiment_fct <- as.factor(test$sentiment)
+confusionMatrix(pred, test$sentiment_fct)
+```
+
+Accuracy of the model is 67%, which is significantly and substantially better than the naive classifier's 49% accuracy. Thus, using the derived model weights is a good, but admittedly not great, method for classifying a tweet's embeddings as having positive or negative sentiment. It would be interesting to see how model accuracy could be improved.
